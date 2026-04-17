@@ -292,6 +292,7 @@ elif page == "Internals":
 
     st.markdown("<hr>", unsafe_allow_html=True)
     st.markdown("#### 3. ACID Compliance Demo")
+    st.write("Demonstrates handling a mid-transaction crash by executing statements and then forcing a ROLLBACK.")
     if st.button("Simulate Rollback Event"):
         if conn:
             try:
@@ -299,16 +300,102 @@ elif page == "Internals":
                 cur.execute("SELECT COUNT(*) FROM Repositories")
                 before_repo = cur.fetchone()[0]
                 
-                # Bad PK
+                st.info("Executing: `INSERT INTO Users (user_id, github_username) VALUES (9999999, 'acid_test_user')`")
                 cur.execute("INSERT INTO Users (user_id, github_username) VALUES (9999999, 'acid_test_user')")
+                
+                st.info("Executing: `INSERT INTO Repositories (repo_id, repo_name, owner_id) VALUES (9999999, 'acid_test_repo', 9999999)`")
                 cur.execute("INSERT INTO Repositories (repo_id, repo_name, owner_id) VALUES (9999999, 'acid_test_repo', 9999999)")
+                
+                st.error("Simulated Application Crash! Rolling back transaction...")
                 conn.rollback()
                 
                 cur.execute("SELECT COUNT(*) FROM Repositories")
                 after_repo = cur.fetchone()[0]
                 
                 st.success("Transaction rolled back dynamically!")
+                st.caption("**Why it failed**: We programmatically executed a `ROLLBACK` command midway through the transaction to simulate an application crash before the final `COMMIT` could be issued.")
                 st.write(f"Repositories before failed insert: **{before_repo}** | Repositories after rollback: **{after_repo}**")
             except Exception as e:
                 conn.rollback()
                 st.error(f"Error: {e}")
+
+    st.markdown("<hr>", unsafe_allow_html=True)
+    st.markdown("#### 4. Index Impact Test (Performance)")
+    st.write("Demonstrate how indexing improves query performance on large datasets.")
+    if st.button("Run Index vs No-Index Performance Test"):
+        if conn:
+            import time
+            try:
+                cur = conn.cursor()
+                
+                # Ensure no index exists initially
+                cur.execute("DROP INDEX IF EXISTS idx_commits_msg")
+                conn.commit()
+                
+                # 1. No Index Time
+                start_no = time.perf_counter()
+                cur.execute("SELECT COUNT(*) FROM Commits WHERE to_tsvector('english', coalesce(message, '')) @@ to_tsquery('english', 'fix')")
+                cur.fetchone()
+                time_no_index = (time.perf_counter() - start_no) * 1000
+                
+                # Create Index
+                with st.spinner("Creating Full-Text GIN Index on message column..."):
+                    cur.execute("CREATE INDEX idx_commits_msg ON Commits USING GIN (to_tsvector('english', coalesce(message, '')))")
+                    conn.commit()
+                
+                # 2. After Index Time
+                start_yes = time.perf_counter()
+                cur.execute("SELECT COUNT(*) FROM Commits WHERE to_tsvector('english', coalesce(message, '')) @@ to_tsquery('english', 'fix')")
+                cur.fetchone()
+                time_index = (time.perf_counter() - start_yes) * 1000
+                
+                # Cleanup
+                cur.execute("DROP INDEX IF EXISTS idx_commits_msg")
+                conn.commit()
+                
+                st.write(f"Query without index: **{time_no_index:.2f} ms**")
+                st.write(f"Query with index: **{time_index:.2f} ms**")
+                
+                # Display Results via Bar Chart
+                df_perf = pd.DataFrame({
+                    "Scenario": ["Before Index (ms)", "After Index (ms)"],
+                    "Time (ms)": [time_no_index, time_index]
+                }).set_index("Scenario")
+                st.bar_chart(df_perf)
+                
+            except Exception as e:
+                conn.rollback()
+                st.error(f"Performance Test Error: {e}")
+
+    st.markdown("<hr>", unsafe_allow_html=True)
+    st.markdown("#### 5. Visualizing Window Functions")
+    st.write("Shows how `LAG()` works in practice to extract Month-over-Month diffs using previous rows.")
+    try:
+        df_trend = run_query("SELECT month, commit_count, delta FROM monthly_commit_trend")
+        if not df_trend.empty:
+            df_trend_agg = df_trend.groupby("month").sum(numeric_only=True).reset_index()
+            df_plot = df_trend_agg.set_index("month")[["commit_count", "delta"]]
+            df_plot.rename(columns={"commit_count": "Monthly Commits", "delta": "MoM Delta"}, inplace=True)
+            st.line_chart(df_plot)
+            st.caption("The `MoM Delta` line visualizes the output of the PostgreSQL `LAG(commit_count)` partition mapping against the aggregate `Monthly Commits` line.")
+        else:
+            st.info("No trend data available for window function visualization. Run sync.")
+    except Exception as e:
+        st.error(f"Error fetching window function view: {e}")
+
+    st.markdown("<hr>", unsafe_allow_html=True)
+    st.markdown("#### 6. Data Integrity / Constraint Demonstration")
+    st.write("Shows how database constraints enforce correctness independently of application logic.")
+    if st.button("Simulate Foreign Key Violation"):
+        if conn:
+            try:
+                cur = conn.cursor()
+                cur.execute("INSERT INTO Repository_Languages (repo_id, language_id, bytes_written) VALUES (-999, 1, 100)")
+                conn.commit()
+            except psycopg2.errors.ForeignKeyViolation as e:
+                conn.rollback()
+                st.error(f"🚨 Foreign Key Violation Caught!\n\n{e}")
+                st.info("Referential integrity is enforced at the database schema level. The PostgreSQL engine implicitly blocked inserting a language stat for a non-existent `repo_id = -999`, preventing orphaned data insertions regardless of our frontend Python layer.")
+            except Exception as e:
+                conn.rollback()
+                st.error(f"General Error: {e}")
